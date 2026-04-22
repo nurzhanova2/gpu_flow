@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: gpuflow-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gpuflow}
+      POSTGRES_USER: ${POSTGRES_USER:-gpuflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gpuflow}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - gpuflow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gpuflow} -d ${POSTGRES_DB:-gpuflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gpuflow-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-gpuflow}:${POSTGRES_PASSWORD:-gpuflow}@db:5432/${POSTGRES_DB:-gpuflow}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/srv/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  gpuflow_pg_data:

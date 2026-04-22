@@ -1,5 +1,11 @@
 # Dependencies
 node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
 
 # Build output
 dist/
@@ -18,6 +24,9 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+
+# Local DB
+*.db
 
 # OS / Editor
 .DS_Store
