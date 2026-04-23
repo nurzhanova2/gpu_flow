@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints, field_validator
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_dashboard_service, get_queue_service, get_session_service, require_admin
@@ -91,6 +91,7 @@ async def warn_session(
 @router.post("/admin/users/{user_id}/block")
 async def block_user(
     user_id: str,
+    request: Request,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -120,6 +121,7 @@ async def block_user(
     user.is_blocked = True
     db.add(AuditLog(actor_user_id=admin.id, action="user.block", entity_type="user", entity_id=user.id, meta={}))
     await db.commit()
+    await request.app.state.realtime_manager.disconnect_user(user.id, code=1008, reason="user_blocked")
     return {"userId": user.id, "blocked": True}
 
 

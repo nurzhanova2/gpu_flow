@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = Field(default=720, alias="JWT_EXPIRE_MINUTES")
     login_max_attempts: int = Field(default=5, alias="LOGIN_MAX_ATTEMPTS")
     login_lockout_seconds: int = Field(default=300, alias="LOGIN_LOCKOUT_SECONDS")
+    login_guard_state_ttl_seconds: int = Field(default=900, ge=60, alias="LOGIN_GUARD_STATE_TTL_SECONDS")
+    login_guard_max_states: int = Field(default=10000, ge=100, alias="LOGIN_GUARD_MAX_STATES")
     allow_user_registration: bool = Field(default=True, alias="ALLOW_USER_REGISTRATION")
     strict_production_checks: bool = Field(default=True, alias="STRICT_PRODUCTION_CHECKS")
 
@@ -34,6 +36,8 @@ class Settings(BaseSettings):
     queue_start_timeout_seconds: int = Field(default=300, alias="QUEUE_START_TIMEOUT_SECONDS")
     session_idle_timeout_seconds: int = Field(default=120, alias="SESSION_IDLE_TIMEOUT_SECONDS")
     session_max_runtime_seconds: int = Field(default=2400, alias="SESSION_MAX_RUNTIME_SECONDS")
+    admin_warn_rate_limit_count: int = Field(default=3, ge=1, alias="ADMIN_WARN_RATE_LIMIT_COUNT")
+    admin_warn_rate_limit_window_seconds: int = Field(default=60, ge=1, alias="ADMIN_WARN_RATE_LIMIT_WINDOW_SECONDS")
     ws_heartbeat_timeout_seconds: int = Field(default=45, alias="WS_HEARTBEAT_TIMEOUT_SECONDS")
     ws_auth_recheck_seconds: int = Field(default=30, alias="WS_AUTH_RECHECK_SECONDS")
 

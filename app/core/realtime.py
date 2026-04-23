@@ -30,6 +30,18 @@ class RealtimeManager:
         async with self._lock:
             self._clients = [client for client in self._clients if client.websocket is not websocket]
 
+    async def disconnect_user(self, user_id: str, code: int = 1008, reason: str | None = None) -> int:
+        async with self._lock:
+            targets = [client.websocket for client in self._clients if client.user_id == user_id]
+
+        for websocket in targets:
+            try:
+                await websocket.close(code=code, reason=reason)
+            except Exception:  # noqa: BLE001
+                pass
+            await self.disconnect(websocket)
+        return len(targets)
+
     async def publish(
         self,
         event: str,

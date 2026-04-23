@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.config import Settings
+from app.core.auth_guard import LoginGuard
 from app.core.db_lock import release_worker_lock, try_acquire_worker_lock
 from app.core.runtime_guard import validate_runtime_safety
 from app.core.ws_origin import is_allowed_ws_origin
@@ -64,6 +65,29 @@ class AuthSchemaRegressionTests(unittest.TestCase):
                 team="ML",
                 password="12345678",
             )
+
+
+class AuthGuardRegressionTests(unittest.TestCase):
+    def test_login_guard_eviction_under_unique_usernames(self) -> None:
+        async def run() -> None:
+            guard = LoginGuard(
+                max_attempts=5,
+                lockout_seconds=300,
+                state_ttl_seconds=1,
+                max_states=3,
+            )
+
+            for idx in range(4):
+                await guard.register_failure(f"uniq_user_{idx}:127.0.0.1")
+
+            self.assertEqual(len(guard._states), 3)
+            self.assertNotIn("uniq_user_0:127.0.0.1", guard._states)
+
+            await asyncio.sleep(1.1)
+            await guard.assert_not_locked("trigger_cleanup:127.0.0.1")
+            self.assertEqual(len(guard._states), 0)
+
+        asyncio.run(run())
 
 
 class WsOriginRegressionTests(unittest.TestCase):

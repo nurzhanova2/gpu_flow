@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from random import randint, random
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -71,6 +71,17 @@ class SessionService:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": {"code": "FORBIDDEN", "message": "Cannot access this session", "details": {}}},
             )
+        if session.status not in {SessionStatus.running, SessionStatus.idle}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "INVALID_STATE",
+                        "message": "Notebook access is available only for running or idle sessions",
+                        "details": {"status": session.status.value},
+                    }
+                },
+            )
         if session.notebook_url and not self._is_safe_notebook_url(session.notebook_url):
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -97,6 +108,21 @@ class SessionService:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"error": {"code": "FORBIDDEN", "message": "Cannot terminate this session", "details": {}}},
             )
+
+        if session.status in {SessionStatus.terminated, SessionStatus.completed, SessionStatus.failed}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "INVALID_STATE",
+                        "message": "Cannot terminate a finished session",
+                        "details": {"status": session.status.value},
+                    }
+                },
+            )
+
+        if session.status == SessionStatus.terminating:
+            return session
 
         session.status = SessionStatus.terminating
         session.status_updated_at = datetime.now(UTC)
@@ -126,6 +152,44 @@ class SessionService:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error": {"code": "SESSION_NOT_FOUND", "message": "Session not found", "details": {}}},
+            )
+
+        allowed_statuses = {SessionStatus.starting, SessionStatus.running, SessionStatus.idle, SessionStatus.terminating}
+        if session.status not in allowed_statuses:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "INVALID_STATE",
+                        "message": "Cannot warn session in finished state",
+                        "details": {"status": session.status.value},
+                    }
+                },
+            )
+
+        window_start = datetime.now(UTC) - timedelta(seconds=self.settings.admin_warn_rate_limit_window_seconds)
+        warn_count = await self.db.scalar(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.action == "session.warn",
+                AuditLog.actor_user_id == actor.id,
+                AuditLog.entity_type == "session",
+                AuditLog.entity_id == session.id,
+                AuditLog.created_at >= window_start,
+            )
+        )
+        if int(warn_count or 0) >= self.settings.admin_warn_rate_limit_count:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "error": {
+                        "code": "WARN_RATE_LIMITED",
+                        "message": "Warn rate limit exceeded for this session",
+                        "details": {
+                            "limit": self.settings.admin_warn_rate_limit_count,
+                            "windowSeconds": self.settings.admin_warn_rate_limit_window_seconds,
+                        },
+                    }
+                },
             )
 
         self.db.add(Alert(level=AlertLevel.warning, message=f"Session {session.id}: {message}"))

@@ -43,7 +43,12 @@ async def lifespan(app: FastAPI):
     await apply_bootstrap_schema_patches(engine)
 
     app.state.realtime_manager = RealtimeManager()
-    app.state.login_guard = LoginGuard(settings.login_max_attempts, settings.login_lockout_seconds)
+    app.state.login_guard = LoginGuard(
+        settings.login_max_attempts,
+        settings.login_lockout_seconds,
+        state_ttl_seconds=settings.login_guard_state_ttl_seconds,
+        max_states=settings.login_guard_max_states,
+    )
     app.state.slurm_adapter = MockSlurmAdapter()
     app.state.jupyterhub_adapter = MockJupyterHubAdapter()
     app.state.metrics_adapter = MockMetricsAdapter()
@@ -194,6 +199,12 @@ def _select_ws_subprotocol(websocket: WebSocket) -> str | None:
     return None
 
 
+async def _is_user_blocked(user_id: str) -> bool:
+    async with AsyncSessionLocal() as db:
+        user = await db.get(User, user_id)
+    return (not user) or bool(user.is_blocked)
+
+
 @app.websocket(f"{settings.api_v1_prefix}/stream")
 async def stream(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin")
@@ -249,13 +260,14 @@ async def stream(websocket: WebSocket) -> None:
                     decoded = None
 
                 if raw_message == "ping" or (isinstance(decoded, dict) and decoded.get("type") == "ping"):
+                    if await _is_user_blocked(user_id):
+                        await websocket.close(code=1008)
+                        break
                     await websocket.send_json({"type": "pong"})
 
             now_ts = time.monotonic()
             if now_ts - last_auth_check >= settings.ws_auth_recheck_seconds:
-                async with AsyncSessionLocal() as db:
-                    refreshed_user = await db.get(User, user_id)
-                if not refreshed_user or refreshed_user.is_blocked:
+                if await _is_user_blocked(user_id):
                     await websocket.close(code=1008)
                     break
                 last_auth_check = now_ts

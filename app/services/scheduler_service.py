@@ -46,7 +46,7 @@ class SchedulerService:
                 events.append(("queue.updated", {"id": item.id, "status": item.status.value}, item.user_id))
                 continue
 
-            node = await self.node_repo.get_available_node(item.profile.gpu_count)
+            node = await self.node_repo.reserve_available_node(item.profile.gpu_count)
             if not node:
                 continue
 
@@ -70,9 +70,6 @@ class SchedulerService:
             item.slurm_job_id = submit_result["job_id"]
             item.queue_position = 0
             item.eta_seconds = 0
-
-            if item.profile.gpu_count > 0:
-                node.gpu_used = min(node.gpu_total, node.gpu_used + item.profile.gpu_count)
 
             events.append(("queue.updated", {"id": item.id, "status": item.status.value, "nodeTarget": node.hostname}, item.user_id))
             events.append(("session.updated", {"id": session.id, "status": session.status.value, "userId": session.user_id}, session.user_id))

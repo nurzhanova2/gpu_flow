@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.core.db_lock import user_queue_limit_lock
 from app.core.realtime import RealtimeManager
 from app.integrations.slurm.base import SlurmAdapter
 from app.models import AuditLog, LaunchProfile, QueueItem, QueueStatus, Session, SessionStatus, User
@@ -30,51 +31,72 @@ class QueueService:
         self.session_repo = SessionRepository(db)
 
     async def enqueue(self, user: User, profile_id: str, relaunch_from_session_id: str | None = None) -> tuple[QueueItem, int, int]:
-        if user.is_blocked:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={"error": {"code": "USER_BLOCKED", "message": "User is blocked", "details": {}}},
+        async with user_queue_limit_lock(self.db, user.id):
+            user_in_tx = await self.db.get(User, user.id)
+            if not user_in_tx:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={"error": {"code": "USER_NOT_FOUND", "message": "User not found", "details": {}}},
+                )
+
+            if user_in_tx.is_blocked:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"error": {"code": "USER_BLOCKED", "message": "User is blocked", "details": {}}},
+                )
+
+            active_sessions = await self.session_repo.count_user_active_sessions(user_in_tx.id)
+            if active_sessions >= user_in_tx.max_active_sessions:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "ACTIVE_SESSION_LIMIT_REACHED",
+                            "message": "Active session limit reached",
+                            "details": {"max": user_in_tx.max_active_sessions},
+                        }
+                    },
+                )
+
+            queued_count = await self.queue_repo.count_user_active_queue(user_in_tx.id)
+            if queued_count >= user_in_tx.max_queued_requests:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "QUEUE_LIMIT_REACHED",
+                            "message": "Queued request limit reached",
+                            "details": {"max": user_in_tx.max_queued_requests},
+                        }
+                    },
+                )
+
+            profile = await self.db.get(LaunchProfile, profile_id)
+            if not profile:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={"error": {"code": "LAUNCH_PROFILE_NOT_FOUND", "message": "Launch profile not found", "details": {}}},
+                )
+
+            item = QueueItem(
+                user_id=user_in_tx.id,
+                profile_id=profile_id,
+                status=QueueStatus.waiting,
+                relaunch_from_session_id=relaunch_from_session_id,
             )
+            await self.queue_repo.create(item)
+            await self._recalculate_waiting_positions()
 
-        active_sessions = await self.session_repo.count_user_active_sessions(user.id)
-        if active_sessions >= user.max_active_sessions:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": {
-                        "code": "ACTIVE_SESSION_LIMIT_REACHED",
-                        "message": "Active session limit reached",
-                        "details": {"max": user.max_active_sessions},
-                    }
-                },
+            self.db.add(
+                AuditLog(
+                    actor_user_id=user_in_tx.id,
+                    action="queue.enqueue",
+                    entity_type="queue",
+                    entity_id=item.id,
+                    meta={"profile_id": profile_id},
+                )
             )
-
-        queued_count = await self.queue_repo.count_user_active_queue(user.id)
-        if queued_count >= user.max_queued_requests:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": {
-                        "code": "QUEUE_LIMIT_REACHED",
-                        "message": "Queued request limit reached",
-                        "details": {"max": user.max_queued_requests},
-                    }
-                },
-            )
-
-        profile = await self.db.get(LaunchProfile, profile_id)
-        if not profile:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": {"code": "LAUNCH_PROFILE_NOT_FOUND", "message": "Launch profile not found", "details": {}}},
-            )
-
-        item = QueueItem(user_id=user.id, profile_id=profile_id, status=QueueStatus.waiting, relaunch_from_session_id=relaunch_from_session_id)
-        await self.queue_repo.create(item)
-        await self._recalculate_waiting_positions()
-
-        self.db.add(AuditLog(actor_user_id=user.id, action="queue.enqueue", entity_type="queue", entity_id=item.id, meta={"profile_id": profile_id}))
-        await self.db.commit()
+            await self.db.commit()
 
         await self.realtime.publish_admin_and_user(
             "queue.updated",
@@ -142,6 +164,17 @@ class QueueService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"error": {"code": "QUEUE_ITEM_NOT_FOUND", "message": "Queue item not found", "details": {}}},
             )
+        if item.status != QueueStatus.waiting or item.is_archived:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "QUEUE_ITEM_NOT_PROMOTABLE",
+                        "message": "Only non-archived waiting queue items can be promoted",
+                        "details": {"status": item.status.value, "archived": item.is_archived},
+                    }
+                },
+            )
 
         item.priority += 1
         await self._recalculate_waiting_positions()
@@ -164,12 +197,19 @@ class QueueService:
                 detail={"error": {"code": "QUEUE_ITEM_NOT_FOUND", "message": "Queue item not found", "details": {}}},
             )
 
+        now = datetime.now(UTC)
         if item.slurm_job_id:
             await self.slurm_adapter.cancel_job(item.slurm_job_id)
 
+        linked_session = await self.db.scalar(select(Session).where(Session.queue_item_id == item.id))
+        if linked_session and linked_session.status in [SessionStatus.starting, SessionStatus.running, SessionStatus.idle]:
+            linked_session.status = SessionStatus.terminating
+            linked_session.status_updated_at = now
+            linked_session.termination_reason = "queue_deleted_by_admin"
+
         item.is_archived = True
         item.status = QueueStatus.cancelled
-        item.status_updated_at = datetime.now(UTC)
+        item.status_updated_at = now
 
         self.db.add(AuditLog(actor_user_id=actor.id, action="queue.delete", entity_type="queue", entity_id=item.id, meta={}))
         await self._recalculate_waiting_positions()
@@ -180,6 +220,12 @@ class QueueService:
             {"id": item.id, "status": item.status.value, "archived": True},
             user_id=item.user_id,
         )
+        if linked_session and linked_session.status == SessionStatus.terminating:
+            await self.realtime.publish_admin_and_user(
+                "session.updated",
+                {"id": linked_session.id, "status": linked_session.status.value},
+                user_id=linked_session.user_id,
+            )
         await self._publish_waiting_positions()
         return item
 
